@@ -1,0 +1,155 @@
+name: ai-search
+run-name: ai-search ${{ github.event.inputs.job }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job:
+        description: "מזהה הבקשה (נוצר בתוסף)"
+        required: true
+      data:
+        description: "החיפוש – מוצפן"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    steps:
+      - name: כלים
+        run: python -m pip install -q cryptography beautifulsoup4 playwright
+
+      - name: חיפוש (בדפדפן אמיתי, כדי שגוגל יעבוד)
+        env:
+          KEY_B64: ${{ secrets.AI_DL_KEY }}
+          DATA: ${{ github.event.inputs.data }}
+        run: |
+          python - <<'PY'
+          import base64, gzip, json, os, urllib.parse
+          from bs4 import BeautifulSoup
+          from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+          from playwright.sync_api import sync_playwright
+
+          key = base64.b64decode(os.environ["KEY_B64"])
+          raw = base64.b64decode(os.environ["DATA"])
+          req = json.loads(gzip.decompress(AESGCM(key).decrypt(raw[:12], raw[12:], None)))
+          q = req["q"]
+          page_no = int(req.get("page") or 0)
+          print("::add-mask::" + q)
+          qe = urllib.parse.quote_plus(q)
+
+          ENGINES = [
+              ("Google", "https://www.google.com/search?q=%s&hl=iw&num=20&start=%d" % (qe, page_no * 20), "#search, #rso"),
+              ("Brave", "https://search.brave.com/search?q=%s&offset=%d" % (qe, page_no), "#results"),
+              ("Bing", "https://www.bing.com/search?q=%s&setlang=he&first=%d" % (qe, page_no * 10 + 1), "#b_results"),
+              ("DuckDuckGo", "https://html.duckduckgo.com/html/?q=%s&s=%d" % (qe, page_no * 30), ".results"),
+          ]
+
+          def clean(t):
+              return " ".join((t or "").split())
+
+          def real_url(href):
+              """מנקה קישורי מעקב של מנועי החיפוש."""
+              u = urllib.parse.urlparse(href)
+              qs = urllib.parse.parse_qs(u.query)
+              for k in ("q", "url", "uddg", "u"):
+                  if k in qs and qs[k][0].startswith("http") and ("/url" in u.path or "/l/" in u.path or "uddg" in k):
+                      return qs[k][0]
+              return href
+
+          def extract(html, engine_host):
+              """שולף תוצאות בצורה כללית: קישור חיצוני שיש בו כותרת."""
+              soup = BeautifulSoup(html, "html.parser")
+              out, seen = [], set()
+              for a in soup.find_all("a", href=True):
+                  head = a.find(["h2", "h3"]) or a.find_parent(["h2", "h3"]) or a.select_one(".title,[class*=title]")
+                  if not head:
+                      continue
+                  href = real_url(urllib.parse.urljoin("https://" + engine_host + "/", a["href"]))
+                  host = urllib.parse.urlparse(href).netloc
+                  if not href.startswith("http") or not host or engine_host.split(".")[-2] in host:
+                      continue
+                  if href in seen:
+                      continue
+                  title = clean(head.get_text(" "))
+                  if len(title) < 3:
+                      continue
+                  seen.add(href)
+                  snip, box = "", a
+                  for _ in range(6):
+                      box = box.parent
+                      if box is None:
+                          break
+                      txt = clean(box.get_text(" "))
+                      if len(txt) > len(title) + 50:
+                          snip = txt.replace(title, "", 1).strip()[:300]
+                          break
+                  out.append({"title": title, "url": href, "snippet": snip})
+              return out
+
+          results, source, notes = [], "", []
+          with sync_playwright() as p:
+              try:
+                  browser = p.chromium.launch(channel="chrome", headless=True)
+              except Exception:
+                  os.system("python -m playwright install chromium > /dev/null")
+                  browser = p.chromium.launch(headless=True)
+              ctx = browser.new_context(locale="he-IL", user_agent=req.get("ua") or None, viewport={"width": 1280, "height": 900})
+              pg = ctx.new_page()
+              for name, url, sel in ENGINES:
+                  try:
+                      pg.goto(url, wait_until="domcontentloaded", timeout=25000)
+                      try:
+                          pg.wait_for_selector(sel, timeout=8000)
+                      except Exception:
+                          pass
+                      host = urllib.parse.urlparse(pg.url).netloc
+                      if "sorry" in pg.url or "captcha" in pg.content().lower()[:20000]:
+                          notes.append(name + ": ביקש אימות (קאפצ'ה)")
+                          continue
+                      results = extract(pg.content(), host)[:25]
+                  except Exception as e:
+                      notes.append("%s: %s" % (name, type(e).__name__))
+                      results = []
+                  if results:
+                      source = name
+                      break
+                  notes.append(name + ": אין תוצאות")
+              browser.close()
+
+          out = json.dumps({"q": q, "page": page_no, "source": source, "results": results, "notes": notes}, ensure_ascii=False)
+          iv = os.urandom(12)
+          enc = iv + AESGCM(key).encrypt(iv, gzip.compress(out.encode()), None)
+          os.makedirs("pack", exist_ok=True)
+          open("pack/results.txt", "w").write(base64.b64encode(enc).decode())
+          print("source:", source or "none", "count:", len(results), "notes:", len(notes))
+          PY
+
+      - name: העלאה לנכסים
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: gh release create "s-${{ github.event.inputs.job }}" pack/results.txt --title "ai-search" --notes "נמחק אוטומטית" --prerelease
+
+      - name: דיווח על תקלה
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          echo "החיפוש נכשל בריצה." > error.txt
+          gh release create "s-${{ github.event.inputs.job }}" error.txt --title "ai-search error" --notes "" --prerelease || true
+
+      - name: ניקוי חיפושים ישנים (מעל שעה)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cutoff=$(date -u -d '1 hour ago' +%s)
+          gh release list --limit 100 --json tagName,createdAt -q '.[] | select(.tagName|startswith("s-")) | "\(.tagName) \(.createdAt)"' | while read tag created; do
+            if [ "$(date -u -d "$created" +%s)" -lt "$cutoff" ]; then gh release delete "$tag" --yes --cleanup-tag || true; fi
+          done
